@@ -1,0 +1,15 @@
+common-obj-y += migration.o tcp.o
+common-obj-y += output-buffer.o
+common-obj-y += mc-rdma.o
+common-obj-y += getdelays.o
+common-obj-y += colo-comm.o
+common-obj-$(CONFIG_COLO) += colo.o colo-failover.o
+common-obj-y += vmstate.o
+common-obj-y += qemu-file.o qemu-file-buf.o qemu-file-unix.o qemu-file-stdio.o
+common-obj-y += xbzrle.o postcopy-ram.o
+
+common-obj-$(CONFIG_RDMA) += rdma.o
+common-onj-y += gettime.o
+common-obj-$(CONFIG_POSIX) += exec.o unix.o fd.o
+
+common-obj-y += block.o
