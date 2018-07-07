@@ -27,19 +27,7 @@ Tested using Ubuntu 16.04.2 (64bit), MLNX_OFED_LINUX-3.4-2.0.0.0-ubuntu16.04-x86
 - Qemu-ifup/Qemu-ifdown
 ```
 Primary:
-root@master# cat /etc/qemu-ifup
-#!/bin/sh
-switch=br0
-if [ -n "$1" ]; then
-         ip link set $1 up
-         brctl addif ${switch} $1
-fi
-root@master# cat /etc/qemu-ifdown
-!/bin/sh
-switch=br0
-if [ -n "$1" ]; then
-        brctl delif ${switch} $1
-fi
+root@master# mv qemu-ifup qemu-ifdown /etc/
 Secondary:
 like Primary side
 ```

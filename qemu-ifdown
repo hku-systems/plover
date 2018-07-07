@@ -1,0 +1,5 @@
+!/bin/sh
+switch=br0
+if [ -n "$1" ]; then
+        brctl delif ${switch} $1
+fi
