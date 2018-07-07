@@ -1,4 +1,4 @@
-## How to setup/test COLO
+## How to setup/test PLOVER
 
 Tested using Ubuntu 16.04.2 (64bit), MLNX_OFED_LINUX-3.4-2.0.0.0-ubuntu16.04-x86_64
 
