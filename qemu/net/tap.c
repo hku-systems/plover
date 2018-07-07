@@ -199,6 +199,9 @@ static void tap_send(void *opaque)
     int size;
     int packets = 0;
 
+    int not_consensus_here = proxy_get_e1000();
+
+
     while (true) {
         uint8_t *buf = s->buf;
 
@@ -211,8 +214,7 @@ static void tap_send(void *opaque)
             buf  += s->host_vnet_hdr_len;
             size -= s->host_vnet_hdr_len;
         }
-
-        if (is_leader()) {
+        if (is_leader() && !not_consensus_here) {
 
             static int colo_gettime = -1;
             if (colo_gettime == -1) {
@@ -228,10 +230,9 @@ static void tap_send(void *opaque)
 
             if (colo_gettime) {
                 int64_t mirror_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - mirror_start;
-                fprintf(stderr, "mirror_time: %"PRId64" ns\n", mirror_time);
+                //fprintf(stderr, "mirror_time: %"PRId64" ns\n", mirror_time);
             }
         }
-
         size = qemu_send_packet_async(&s->nc, buf, size, tap_send_completed);
         if (size == 0) {
             tap_read_poll(s, false);

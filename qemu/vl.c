@@ -163,6 +163,7 @@ int smp_cpus = 1;
 int max_cpus = 0;
 int smp_cores = 1;
 int smp_threads = 1;
+int pcpu_id_array[131072 + 2] = {0}; 
 int acpi_enabled = 1;
 int no_hpet = 0;
 int fd_bootchk = 1;
@@ -3862,6 +3863,8 @@ int main(int argc, char **argv, char **envp)
                     role = LEADER;
                 } else if (strcmp(optarg, "secondary") == 0) {
                     role = MAJOR_BACKUP;
+                } else if (strcmp(optarg, "sentinel") == 0) {
+                    role = STANDBY_BACKUP;
                 }
                 if (!opts) {
                     exit(1);
@@ -4556,6 +4559,21 @@ int main(int argc, char **argv, char **envp)
     current_machine->cpu_model = cpu_model;
 
     machine_class->init(current_machine);
+
+    int host_cpu_num = get_pcpu_num(false, pcpu_id_array);
+    pcpu_id_array[0] = host_cpu_num; 
+    pcpu_id_array[1] = 1; 
+    pcpu_id_array[2] = 3; 
+    pcpu_id_array[3] = 5; 
+    pcpu_id_array[4] = 7;
+
+
+    pin_all_vcpus(smp_cpus, pcpu_id_array, &err);
+    if (err) {
+       error_report_err(err);
+       exit(1);
+    }
+
 
     realtime_init();
 

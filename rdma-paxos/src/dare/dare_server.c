@@ -1295,6 +1295,7 @@ random_election_timeout()
                         + elec_timeout_low;
 //info(log_fp, "election to in sec: %lf\n", (double)timeout * 1e-6);
     /* Return time in seconds */
+    printf("election to in sec: %lf\n", (double)timeout * 1e-6);
     return (double)timeout * 1e-6;
 }
 

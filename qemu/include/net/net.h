@@ -239,7 +239,6 @@ void outgoing_counter_init(void);
 
 
 uint64_t get_output_counter(void);
-
 int reset_output_counter(void);
 
 

@@ -19,6 +19,8 @@ int proxy_read_config(struct proxy_node_t* cur_node,const char* config_path){
     config_lookup_int(&config_file,"recheck_num",&cur_node->recheck_num);
     config_lookup_int(&config_file,"sync_type",&cur_node->sync_type);
     config_lookup_int(&config_file,"colo_gettime",&cur_node->colo_gettime);
+    config_lookup_int(&config_file,"batching",&cur_node->batching);
+    config_lookup_int(&config_file,"e1000_speedup",&cur_node->e1000_speedup);
 
     const char* db_name;
     if(!config_lookup_string(&config_file,"db_name",&db_name)){

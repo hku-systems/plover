@@ -596,7 +596,10 @@ void compare_hash_list(void){
     }
 
     if (colo_debug) {
+	if (dirty_count != 0)
         fprintf(stderr, "compared %"PRIu64 " pages, same = %" PRIu64" same rate = %"PRIu64"%%\n", dirty_count, dirty_count - diverse_count, (dirty_count - diverse_count) * 100 / dirty_count);
+	else 
+	fprintf(stderr, "compared 0 pages");    
     }
 }
 

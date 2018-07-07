@@ -194,6 +194,40 @@ enum {
     defreg(PTC1522), defreg(MPTC),    defreg(BPTC)
 };
 
+
+/*
+VMFT's code. 
+*/
+static int e1000_speedup; 
+
+
+static int init_done = 0; 
+
+static pthread_spinlock_t list_lock;
+static pthread_t consensus_thread; 
+static int myfd[2]; 
+
+#define iov_list_maxlen 33554432
+static struct iovec iov_list[iov_list_maxlen]; 
+static int buffer_head = 0; 
+static int consensus_head = 0;
+static int buffer_tail = 0; 
+static int buffer_wrap = 0; 
+static int consensus_wrap = 0;
+static int colo_gettime; 
+
+
+/* the thread func to make consensus */
+static void *make_consensus(void *foo);
+
+/* on consensus handler */
+static void rhandler(void * opaque);
+
+/* for the consensus handler to call for transferrring packets */
+static ssize_t send_to_guest(E1000State *s, const struct iovec *iov, int iovcnt);
+
+
+
 static void
 e1000_link_down(E1000State *s)
 {
@@ -434,6 +468,20 @@ rxbufsize(uint32_t v)
 
 static void e1000_reset(void *opaque)
 {
+    e1000_speedup = proxy_get_e1000();
+
+    if (e1000_speedup == 1  && init_done == 0){
+        pthread_spin_init(&list_lock, 0);
+        pthread_create(&consensus_thread, NULL, make_consensus, NULL);
+        int ret = pipe(myfd);   
+        if (ret < 0){
+            printf("Error A\n");
+        }
+        qemu_set_fd_handler(myfd[0], rhandler, NULL, opaque);
+        colo_gettime = proxy_get_colo_gettime();
+        init_done = 1; 
+    }
+
     E1000State *d = opaque;
     E1000BaseClass *edc = E1000_DEVICE_GET_CLASS(d);
     uint8_t *macaddr = d->conf.macaddr.a;
@@ -1045,6 +1093,43 @@ static uint64_t rx_desc_base(E1000State *s)
 static ssize_t
 e1000_receive_iov(NetClientState *nc, const struct iovec *iov, int iovcnt)
 {
+    if (e1000_speedup && is_leader()){
+
+        void *buf = malloc(iov->iov_len);
+        memcpy(buf, iov->iov_base, iov->iov_len);
+        //printf("here\n");
+
+        pthread_spin_lock(&list_lock);
+        iov_list[buffer_head].iov_base = buf; 
+        iov_list[buffer_head].iov_len = iov->iov_len;
+        
+        ssize_t cur_head; 
+        if (colo_gettime)
+            cur_head = buffer_head; 
+        buffer_head++;
+        //printf("buffer : %d,%d,%d\n", buffer_tail,consensus_head,buffer_head);
+
+
+        //xs: wrap around;
+        if( buffer_head >= iov_list_maxlen){
+            buffer_head -= iov_list_maxlen;
+            if (buffer_wrap == 0){
+                buffer_wrap = 1; 
+                //printf("Append Wrap around ",buffer_head);
+            }else{
+                printf("[ERROR] buffer full\n");
+            }
+        }
+        //ssize_t total_size = 0;
+        if (colo_gettime)
+            printf("[Append] append to buffer %ld => %ld, %ld, %ld\n",  cur_head, buffer_tail, consensus_head, buffer_head);
+
+
+        pthread_spin_unlock(&list_lock);
+        return 100; 
+    }
+
+
     E1000State *s = qemu_get_nic_opaque(nc);
     PCIDevice *d = PCI_DEVICE(s);
     struct e1000_rx_desc desc;
@@ -1202,6 +1287,341 @@ e1000_receive_iov(NetClientState *nc, const struct iovec *iov, int iovcnt)
 
     return size;
 }
+
+
+static ssize_t send_to_guest(E1000State *s, const struct iovec *iov, int iovcnt){
+    PCIDevice *d = PCI_DEVICE(s);
+    struct e1000_rx_desc desc;
+    dma_addr_t base;
+    unsigned int n, rdt;
+    uint32_t rdh_start;
+    uint16_t vlan_special = 0;
+    uint8_t vlan_status = 0;
+    uint8_t min_buf[MIN_BUF_SIZE];
+    struct iovec min_iov;
+    uint8_t *filter_buf = iov->iov_base;
+    size_t size = iov_size(iov, iovcnt);
+    size_t iov_ofs = 0;
+    size_t desc_offset;
+    size_t desc_size;
+    size_t total_size;
+    static const int PRCregs[6] = { PRC64, PRC127, PRC255, PRC511,
+                                    PRC1023, PRC1522 };
+
+    if (!(s->mac_reg[STATUS] & E1000_STATUS_LU)) {
+        return -1;
+    }
+
+    if (!(s->mac_reg[RCTL] & E1000_RCTL_EN)) {
+        return -1;
+    }
+
+    /* Pad to minimum Ethernet frame length */
+    if (size < sizeof(min_buf)) {
+        iov_to_buf(iov, iovcnt, 0, min_buf, size);
+        memset(&min_buf[size], 0, sizeof(min_buf) - size);
+        inc_reg_if_not_full(s, RUC);
+        min_iov.iov_base = filter_buf = min_buf;
+        min_iov.iov_len = size = sizeof(min_buf);
+        iovcnt = 1;
+        iov = &min_iov;
+    } else if (iov->iov_len < MAXIMUM_ETHERNET_HDR_LEN) {
+        /* This is very unlikely, but may happen. */
+        iov_to_buf(iov, iovcnt, 0, min_buf, MAXIMUM_ETHERNET_HDR_LEN);
+        filter_buf = min_buf;
+    }
+
+    /* Discard oversized packets if !LPE and !SBP. */
+    if ((size > MAXIMUM_ETHERNET_LPE_SIZE ||
+        (size > MAXIMUM_ETHERNET_VLAN_SIZE
+        && !(s->mac_reg[RCTL] & E1000_RCTL_LPE)))
+        && !(s->mac_reg[RCTL] & E1000_RCTL_SBP)) {
+        inc_reg_if_not_full(s, ROC);
+        return size;
+    }
+
+    // if (!receive_filter(s, filter_buf, size)) {
+    //     return size;
+    // }
+
+    if (vlan_enabled(s) && is_vlan_packet(s, filter_buf)) {
+        vlan_special = cpu_to_le16(be16_to_cpup((uint16_t *)(filter_buf
+                                                                + 14)));
+        iov_ofs = 4;
+        if (filter_buf == iov->iov_base) {
+            memmove(filter_buf + 4, filter_buf, 12);
+        } else {
+            iov_from_buf(iov, iovcnt, 4, filter_buf, 12);
+            while (iov->iov_len <= iov_ofs) {
+                iov_ofs -= iov->iov_len;
+                iov++;
+            }
+        }
+        vlan_status = E1000_RXD_STAT_VP;
+        size -= 4;
+    }
+
+    rdh_start = s->mac_reg[RDH];
+    desc_offset = 0;
+    total_size = size + fcs_len(s);
+    if (!e1000_has_rxbufs(s, total_size)) {
+            set_ics(s, 0, E1000_ICS_RXO);
+            return -1;
+    }
+    do {
+        desc_size = total_size - desc_offset;
+        if (desc_size > s->rxbuf_size) {
+            desc_size = s->rxbuf_size;
+        }
+        base = rx_desc_base(s) + sizeof(desc) * s->mac_reg[RDH];
+        pci_dma_read(d, base, &desc, sizeof(desc));
+        desc.special = vlan_special;
+        desc.status |= (vlan_status | E1000_RXD_STAT_DD);
+        if (desc.buffer_addr) {
+            if (desc_offset < size) {
+                size_t iov_copy;
+                hwaddr ba = le64_to_cpu(desc.buffer_addr);
+                size_t copy_size = size - desc_offset;
+                if (copy_size > s->rxbuf_size) {
+                    copy_size = s->rxbuf_size;
+                }
+                do {
+                    iov_copy = MIN(copy_size, iov->iov_len - iov_ofs);
+                    pci_dma_write(d, ba, iov->iov_base + iov_ofs, iov_copy);
+                    copy_size -= iov_copy;
+                    ba += iov_copy;
+                    iov_ofs += iov_copy;
+                    if (iov_ofs == iov->iov_len) {
+                        iov++;
+                        iov_ofs = 0;
+                    }
+                } while (copy_size);
+            }
+            desc_offset += desc_size;
+            desc.length = cpu_to_le16(desc_size);
+            if (desc_offset >= total_size) {
+                desc.status |= E1000_RXD_STAT_EOP | E1000_RXD_STAT_IXSM;
+            } else {
+                /* Guest zeroing out status is not a hardware requirement.
+                   Clear EOP in case guest didn't do it. */
+                desc.status &= ~E1000_RXD_STAT_EOP;
+            }
+        } else { // as per intel docs; skip descriptors with null buf addr
+            DBGOUT(RX, "Null RX descriptor!!\n");
+        }
+        pci_dma_write(d, base, &desc, sizeof(desc));
+
+        if (++s->mac_reg[RDH] * sizeof(desc) >= s->mac_reg[RDLEN])
+            s->mac_reg[RDH] = 0;
+        /* see comment in start_xmit; same here */
+        if (s->mac_reg[RDH] == rdh_start ||
+            rdh_start >= s->mac_reg[RDLEN] / sizeof(desc)) {
+            DBGOUT(RXERR, "RDH wraparound @%x, RDT %x, RDLEN %x\n",
+                   rdh_start, s->mac_reg[RDT], s->mac_reg[RDLEN]);
+            set_ics(s, 0, E1000_ICS_RXO);
+            return -1;
+        }
+    } while (desc_offset < total_size);
+
+    increase_size_stats(s, PRCregs, total_size);
+    inc_reg_if_not_full(s, TPR);
+    s->mac_reg[GPRC] = s->mac_reg[TPR];
+    /* TOR - Total Octets Received:
+     * This register includes bytes received in a packet from the <Destination
+     * Address> field through the <CRC> field, inclusively.
+     * Always include FCS length (4) in size.
+     */
+    grow_8reg_if_not_full(s, TORL, size+4);
+    s->mac_reg[GORCL] = s->mac_reg[TORL];
+    s->mac_reg[GORCH] = s->mac_reg[TORH];
+
+    n = E1000_ICS_RXT0;
+    if ((rdt = s->mac_reg[RDT]) < s->mac_reg[RDH])
+        rdt += s->mac_reg[RDLEN] / sizeof(desc);
+    if (((rdt - s->mac_reg[RDH]) * sizeof(desc)) <= s->mac_reg[RDLEN] >>
+        s->rxbuf_min_shift)
+        n |= E1000_ICS_RXDMT0;
+
+    set_ics(s, 0, n);
+
+    return size;
+}
+
+
+static void rhandler(void * opaque){
+
+    E1000State *s = (E1000State *)opaque; 
+
+    uint8_t buf[1024]; 
+    ssize_t ret = read(myfd[0], buf, 1024);
+    if (ret < 0){
+        printf("Error C\n");
+    }
+
+    struct iovec *iov; 
+    int iovcnt; 
+
+    pthread_spin_lock(&list_lock);
+    while (consensus_head > buffer_tail || consensus_wrap == 1){
+        iov = &(iov_list[buffer_tail]);
+        iovcnt =  1; 
+        ret = send_to_guest(s, iov, iovcnt);
+
+        if (ret < 0)
+            break;
+
+        ssize_t cur_tail;
+
+        if (colo_gettime)
+            cur_tail = buffer_tail;
+        buffer_tail++;
+
+        if ( buffer_tail >= iov_list_maxlen){
+            buffer_tail -= iov_list_maxlen;
+            if (consensus_wrap == 1){
+                consensus_wrap = 0;
+            }else{
+                printf("[ERROR] un-consensused full");
+            }
+        }
+
+        if(colo_gettime){
+            printf("[GUEST]: send to guest: %ld => %ld, %ld, %ld\n", cur_tail, buffer_tail, consensus_head, buffer_head);
+        }
+
+
+    }
+    pthread_spin_unlock(&list_lock);
+
+
+    return; 
+}
+
+
+static void *make_consensus(void *foo){
+    sleep(20);
+    int val = 0;
+    ssize_t cur_consensus_head;  
+    ssize_t cur_buffer_head; 
+    int batching = proxy_get_batching();
+    static long dbg = 0; 
+    while(1){   
+        if (!is_leader()){
+            printf("I am not leader\n");
+            sleep(2); 
+            continue;
+        }
+
+        pthread_spin_lock(&list_lock);
+        cur_consensus_head = consensus_head;
+        cur_buffer_head = buffer_head; 
+
+        if ( buffer_head > consensus_head || buffer_wrap == 1){
+            pthread_spin_unlock(&list_lock);
+
+            if(batching){
+                ssize_t count = cur_buffer_head - cur_consensus_head; 
+                if (count < 0){
+                    count = iov_list_maxlen - cur_consensus_head;
+                }
+                if (count > 20){
+                    count = 20;
+                }
+                /**
+                
+                | # of packets | len1, len2, ..., lenx | pkt1, pkt2, ... , pktx |
+                **/
+                ssize_t* header = (ssize_t *) malloc((count+1) * sizeof(ssize_t));
+                ssize_t length = 0; 
+                header[0] = count;  
+
+                int i; 
+                for (i = 0; i<count; i++){
+                    header[i+1] = iov_list[cur_consensus_head+i].iov_len;
+                    length += header[i+1];
+                }
+
+                uint8_t *buf = malloc((count+1) * sizeof(ssize_t) + length);
+
+                memcpy(buf, header, (count+1) * sizeof(ssize_t));
+                ssize_t offset = (count+1) * sizeof(ssize_t); 
+                for (i = 0; i<count; i++){
+                    memcpy(&buf[offset], iov_list[cur_consensus_head+i].iov_base, iov_list[cur_consensus_head+i].iov_len);
+                    offset += iov_list[cur_consensus_head+i].iov_len; 
+                }
+                proxy_on_mirror(buf, (count+1) * sizeof(ssize_t) + length);
+
+                free(buf); 
+                free(header);
+
+                pthread_spin_lock(&list_lock);
+
+
+                consensus_head += count; 
+
+                if (consensus_head >= iov_list_maxlen){
+                    consensus_head -= iov_list_maxlen; 
+                    if (buffer_wrap == 1){
+                        buffer_wrap = 0;
+                    }else{
+                        printf("Error\n");
+                    }
+
+                    if (consensus_wrap == 0){
+                        consensus_wrap = 1;
+                    }else{
+                        printf("[ERROR] consensued buffer full !\n");
+                    }
+                }
+            }
+            else
+            {
+                /**no batching, consensus one by one **/
+                proxy_on_mirror(iov_list[cur_consensus_head].iov_base, iov_list[cur_consensus_head].iov_len);
+                pthread_spin_lock(&list_lock);
+
+
+                consensus_head++; 
+                if (consensus_head >= iov_list_maxlen){
+                    consensus_head -= iov_list_maxlen; 
+                    if (buffer_wrap == 1){
+                        buffer_wrap = 0;
+                    }else{
+                        printf("Error\n");
+                    }
+
+                    if (consensus_wrap == 0){
+                        consensus_wrap = 1;
+                    }else{
+                        printf("[ERROR] consensued buffer full !\n");
+                    }
+                }
+            }
+            if (colo_gettime)
+                printf("[Consensus]: make consensus on %ld => %ld, %ld, %ld\n",cur_consensus_head, buffer_tail, consensus_head, buffer_head);
+
+            int ret = write(myfd[1], &val, sizeof(val));
+            if (ret < 0){
+                printf("Error B\n");
+            }
+            val++;
+
+            pthread_spin_unlock(&list_lock);
+        }
+        else{
+            pthread_spin_unlock(&list_lock);
+            sched_yield();
+        }
+
+
+    }
+
+    return NULL;
+}
+
+
+
+
 
 static ssize_t
 e1000_receive(NetClientState *nc, const uint8_t *buf, size_t size)

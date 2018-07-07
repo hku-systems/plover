@@ -356,6 +356,8 @@ static uint64_t mc_receive_message_value(uint32_t expect_msg, Error **errp)
 static int idle_clock_rate_min, idle_clock_rate_max, idle_clock_rate_avg;
 
 #define USE_ESTIMATED_IDLE_CLOCK_RATE
+#define EXIT_COUNT 2000
+static int failover_count;
 
 static void learn_idle_clock_rate(void)
 {
@@ -399,22 +401,30 @@ static uint64_t checkpoint_cnt;
 static int sync_type;
 
 
-
-static void wait_guest_finish(MigrationState *s, bool is_primary)
+#define BACKUP_END_IDLE 6
+static int64_t wait_guest_finish(MigrationState *s, bool is_primary)
 {
     struct timeval t1, t2;
     if (colo_debug) {
         gettimeofday(&t1, NULL);
     }
-
+    int backup_counter = 0;
+    bool received_sync_req = false; 
     int idle_counter = 0;
-    do
+    int64_t primary_counter = -1; 
+    uint64_t start_counter, end_counter;
+    if (is_primary ==false) {
+        // This is only used for intensive workloads.
+        // When test for iperf, comment it.
+        usleep(1000 * 10);
+    }
+    while (1)
     {
+        start_counter = get_output_counter();
+	    backup_counter++;
         if (check_cpu_usage()) { // 1 means working, 0 means idle
             idle_counter = 0;
         } else {
-            uint64_t start_counter, end_counter;
-            start_counter = get_output_counter();
             if (check_disk_usage()) {
                 idle_counter = 0;
             } else {
@@ -427,19 +437,55 @@ static void wait_guest_finish(MigrationState *s, bool is_primary)
                 } 
             }
         }
-    } while (idle_counter < recheck_count);
+        if (is_primary == false && received_sync_req == false){
+            primary_counter = proxy_wait_checkpoint_req();
+            if (primary_counter >= 0){
+                backup_counter = 0;
+                received_sync_req = true; 
+                fprintf(stderr, "primary finishes first !!, output counter = %"PRId64"\n", primary_counter); 
+            }else{
+                usleep(100);
+            }
+        }
+	    if(is_primary == false && received_sync_req == true && backup_counter > BACKUP_END_IDLE)
+		    break;
+        if (is_primary == false && received_sync_req == false){
+            continue; 
+        }
+        if (idle_counter >= recheck_count){
+            break;
+        }
+    } 
+    
+    int wait_output_count = 0; 
+    if (is_primary == false){
+        while(get_output_counter()<primary_counter * 0.8){
+            usleep(100);   
+            wait_output_count++; 
+
+            if (wait_output_count > 100){
+                fprintf(stderr, "failed to wait for output counter!!!!, received %"PRId64", mine = %"PRIu64"\n",
+                primary_counter, get_output_counter());
+                break;
+            }
+        }
+    }
 
     checkpoint_cnt++;
+    int64_t output_counter; 
     if (colo_debug) {
         gettimeofday(&t2, NULL);
         double elapsedTime = (t2.tv_sec - t1.tv_sec) * 1000.0;
         elapsedTime += (t2.tv_usec - t1.tv_usec) / 1000.0;
-        uint64_t output_counter = get_output_counter();
+        output_counter = get_output_counter();
         reset_output_counter();
         fprintf(stderr, "[%s %"PRIu64"] output_counter %"PRIu64", %fms\n", is_primary == true ? "LEADER" : "BACKUP", checkpoint_cnt, output_counter, elapsedTime);
+        fprintf(stderr,"waited %d ms for output\n\n", wait_output_count/10);
+        if (is_primary == true && checkpoint_cnt == EXIT_COUNT && failover_count == 1)
+            exit(0);
     }
 
-    return;
+    return output_counter;
 }
 
 static void static_timing_sync(MigrationState *s)
@@ -461,14 +507,14 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
 
     // colo_send_message(s->to_dst_file, COLO_MESSAGE_CHECKPOINT_REQUEST,
     //                   &local_err);
-
+    int64_t output_counter; 
     if (sync_type == CHECK_IDLE_SYNC) {
-        wait_guest_finish(s, true);
+        output_counter = wait_guest_finish(s, true);
     } else if (sync_type == STATIC_TIME_SYNC) {
         static_timing_sync(s);
     }
     
-    proxy_on_checkpoint_req();
+    proxy_on_checkpoint_req(output_counter);
 
     if (local_err) {
         goto out;
@@ -627,6 +673,8 @@ static int colo_do_checkpoint_transaction(MigrationState *s,
         /* Fix me: Just let the colo thread exit ? */
         qemu_thread_exit(0);
     }
+#else
+    usleep(7*1000);
 #endif
     ret = 0;
     //trace_colo_vm_state_change("stop", "run");
@@ -675,6 +723,7 @@ static void colo_process_checkpoint(MigrationState *s)
     hash_init();
 
     colo_primary_transfer = false;
+    failover_count++;
 
     QEMUSizedBuffer *buffer = NULL;
     int64_t current_time, checkpoint_time = qemu_clock_get_ms(QEMU_CLOCK_HOST);
@@ -724,13 +773,17 @@ static void colo_process_checkpoint(MigrationState *s)
 
     qemu_mutex_lock_iothread();
     /* start block replication */
-    replication_start_all(REPLICATION_MODE_PRIMARY, &local_err);
-    if (local_err) {
-        qemu_mutex_unlock_iothread();
-        goto out;
+
+    if (failover_count == 1) // secondary takes over
+    {
+        replication_start_all(REPLICATION_MODE_PRIMARY, &local_err);
+        if (local_err) {
+            qemu_mutex_unlock_iothread();
+            goto out;
+        }
+        vm_start();
     }
 
-    vm_start();
     qemu_mutex_unlock_iothread();
     trace_colo_vm_state_change("stop", "run");
 
@@ -897,6 +950,7 @@ static int colo_prepare_before_load(QEMUFile *f)
 void *colo_process_incoming_thread(void *opaque)
 {
     hash_init();
+    failover_count++;
 
     MigrationIncomingState *mis = opaque;
     QEMUFile *fb = NULL;
@@ -978,7 +1032,20 @@ void *colo_process_incoming_thread(void *opaque)
         int request;
         // colo_wait_handle_message(mis->from_src_file, &request, &local_err);
 
-        proxy_wait_checkpoint_req();
+        if (sync_type != CHECK_IDLE_SYNC){
+            proxy_wait_checkpoint_req();
+        }
+        if (sync_type == CHECK_IDLE_SYNC) {
+            wait_guest_finish(NULL, false);
+        }
+
+        if((checkpoint_cnt + 1) == EXIT_COUNT && failover_count == 1)
+        {
+            failover_set_state(FAILOVER_STATUS_RELAUNCH, FAILOVER_STATUS_NONE);
+            failover_request_active(NULL);
+            goto out;
+        }
+
         request = 1;
         disable_apply_committed_entries();
 
@@ -989,10 +1056,6 @@ void *colo_process_incoming_thread(void *opaque)
         if (failover_request_is_active()) {
             error_report("failover request");
             goto out;
-        }
-
-        if (sync_type == CHECK_IDLE_SYNC) {
-            wait_guest_finish(NULL, false);
         }
 
         qemu_mutex_lock_iothread();
@@ -1133,6 +1196,13 @@ void *colo_process_incoming_thread(void *opaque)
         //               &local_err);
         mc_send_message(COLO_MESSAGE_VMSTATE_LOADED,&local_err);
         if (local_err) {
+            goto out;
+        }
+
+        if (checkpoint_cnt == (EXIT_COUNT -1)){
+            fprintf(stderr, "COLO: FAILOVER_STATUS_RELAUNCH" );
+            failover_set_state(FAILOVER_STATUS_RELAUNCH, FAILOVER_STATUS_NONE);
+            failover_request_active(NULL);
             goto out;
         }
 

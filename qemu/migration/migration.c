@@ -434,6 +434,8 @@ static void process_incoming_migration_co(void *opaque)
     qemu_fclose(f);
     free_xbzrle_decoded_buf();
 
+    printf("checkpoint incoming thread exit\n");
+
     if (ret < 0) {
         migrate_set_state(&mis->state, MIGRATION_STATUS_ACTIVE,
                           MIGRATION_STATUS_FAILED);

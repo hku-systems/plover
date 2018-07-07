@@ -498,23 +498,6 @@ static int get_pci_irq_state(QEMUFile *f, void *pv, size_t size)
         }
     }
 
-    // for (i = 0; i < PCI_NUM_PINS; ++i) {
-    //     pci_set_irq_state(s, i, irq_state[i]);
-    // }
-
-    for (i = 0; i < PCI_NUM_PINS; ++i) {
-        pci_set_irq_state(s, i, irq_state[i]);//xs: but the bus state is not set
-        pci_update_irq_status(s);
-
-        if (irq_state[i] != 0){
-            s->bus->set_irq(s->bus->irq_opaque, PCI_NUM_PINS-1-i , 1);
-            s->bus->irq_count[PCI_NUM_PINS-1-i] = 1; 
-        }
-
-    }
-
-    
-
     return 0;
 }
 

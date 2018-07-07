@@ -745,6 +745,18 @@ void cpu_reset_interrupt(CPUState *cpu, int mask);
  */
 void cpu_exit(CPUState *cpu);
 
+ /**
+ * cpu_pin:
+ * @cpu: The vitual CPU to pin.
+ * @pcpu_id: The host's physical or logical processor's id.
+ *
+ * pin CPU, i.e. set the CPU's affinity.
+ */
+void cpu_pin(CPUState *cpu, int pcpu_id);
+
+
+
+
 /**
  * cpu_resume:
  * @cpu: The CPU to resume.

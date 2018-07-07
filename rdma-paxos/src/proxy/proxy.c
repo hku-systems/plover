@@ -168,17 +168,22 @@ void proxy_on_mirror(uint8_t *buf, int len)
     return;
 }
 
-void proxy_on_checkpoint_req(void)
+void proxy_on_checkpoint_req(int64_t output_counter)
 {
-    leader_handle_submit_req(NULL, 0, CHECKPOINT);
+    //fprintf(stderr, "!!!!checkpoint request for counter %"PRId64"\n", output_counter);
+    leader_handle_submit_req(&output_counter, sizeof(output_counter), CHECKPOINT);
     return;
 }
 
-void proxy_wait_checkpoint_req(void)
+int64_t proxy_wait_checkpoint_req(void)
 {
-    while (checkpoint_req_status != CHECKPOINT_REQ_READY);
-    checkpoint_req_status = CHECKPOINT_REQ_WAIT;
-    return;
+    if (checkpoint_req_status == CHECKPOINT_REQ_WAIT)
+        return -1; 
+    else{
+        int64_t tmp = checkpoint_req_status;
+        checkpoint_req_status = CHECKPOINT_REQ_WAIT;
+        return tmp;
+    }
 }
 
 static void update_highest_rec(void*arg)
@@ -187,10 +192,39 @@ static void update_highest_rec(void*arg)
     proxy->highest_rec++;   
 }
 
+static void get_socket_buffer_size(int sockfd)
+{
+    socklen_t i;
+    size_t len;
+
+    i = sizeof(len);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &len, &i) < 0) {
+        perror(": getsockopt");
+    }
+
+    printf("receive buffer size = %d\n", len);
+
+    if (getsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &len, &i) < 0) {
+        perror(": getsockopt");
+    }
+
+    printf("send buffer size = %d\n", len);
+}
+
+static void set_socket_buffer_size(int sockfd, int size)
+{
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) < 0) {
+        perror(": setsockopt");
+    }
+}
+
 static void set_filter_mirror_fd(void*arg, int fd)
 {
-    proxy_node* proxy = arg;
-    proxy->mirror_clientfd = fd;
+        proxy_node* proxy = arg;
+        proxy->mirror_clientfd = fd;
+        get_socket_buffer_size(fd);
+        set_socket_buffer_size(fd, 10649600);
+        get_socket_buffer_size(fd);
 }
 
 int control_tsc(void)
@@ -216,6 +250,16 @@ int proxy_get_colo_debug(void)
 int proxy_get_colo_gettime(void)
 {
     return proxy->colo_gettime;
+}
+
+int proxy_get_batching(void)
+{
+    return proxy->batching;
+}
+
+int proxy_get_e1000(void)
+{
+    return proxy->e1000_speedup;
 }
 
 static void stablestorage_save_request(void* data,void*arg)
@@ -279,18 +323,54 @@ static int stablestorage_load_records(void*buf,uint32_t size,void*arg)
 
 static void do_action_send(size_t data_size,void* data,void* arg)
 {
+    //fprintf(stderr, "do send\n");
     proxy_node* proxy = arg;
-    uint32_t len = htonl(data_size);
+    int batching = proxy_get_batching();
+    int e1000_speedup = proxy_get_e1000();
+    static long dbg = 0; 
 
-    int n = send(proxy->mirror_clientfd, &len, sizeof(len), 0);
-    if (n < 0)
-        fprintf(stderr, "ERROR writing to socket!\n");
+    if (batching && e1000_speedup)
+    {
+        ssize_t npackets; 
+        memcpy(&npackets, data, sizeof(npackets));
+        
+        ssize_t offset = (npackets+1) * sizeof(ssize_t);
 
-    n = send(proxy->mirror_clientfd, data, data_size, 0);
-    if (n < 0)
-        fprintf(stderr, "ERROR writing to socket!\n");
+        ssize_t *length = (ssize_t*) malloc(npackets * sizeof(ssize_t));
 
+        memcpy (length, data+sizeof(ssize_t),npackets * sizeof(ssize_t));
+        //fprintf(stderr, "[%ld] received consens on , data_size = %zd, tototal %d packets:\n", dbg++,
+        //data_size, npackets);
+
+    
+        int i, n; 
+        for (i = 0; i<npackets; i++){
+            //xs: seems need to in network order
+            uint32_t len = htonl(length[i]); 
+            //fprintf(stderr, "packet [%d]: ,length = %zd\n", i, length[i]);
+            n = send(proxy->mirror_clientfd, &len, sizeof(len),MSG_DONTWAIT);
+            if (n < 0)
+                fprintf(stderr, "ERROR writing to socket! A\n");
+
+            n = send(proxy->mirror_clientfd, &data[offset], length[i], MSG_DONTWAIT);
+            if (n < 0)
+                fprintf(stderr, "ERROR writing to socket! B\n");
+            offset += length[i]; 
+        }
+    }
+    else{
+        uint32_t len = htonl(data_size);
+        int n = send(proxy->mirror_clientfd, &len, sizeof(len), 0);
+        if (n < 0)
+            fprintf(stderr, "ERROR writing to socket!\n");
+
+        n = send(proxy->mirror_clientfd, data, data_size, 0);
+        if (n < 0)
+            fprintf(stderr, "ERROR writing to socket!\n");
+
+    }
     proxy->sync_req_id++;
+    //fprintf(stderr,"before return\n");
 }
 
 static void do_action_to_server(uint16_t clt_id,uint8_t type,size_t data_size,void* data,void*arg)
@@ -300,7 +380,7 @@ static void do_action_to_server(uint16_t clt_id,uint8_t type,size_t data_size,vo
     if(proxy->req_log){
         output = proxy->req_log_file;
     }
-
+    //fprintf(stderr, "received consensus, type =%d\n", type);
     switch(type) {
         case MIRROR:
         {
@@ -309,7 +389,9 @@ static void do_action_to_server(uint16_t clt_id,uint8_t type,size_t data_size,vo
         }
         case CHECKPOINT:
         {
-            checkpoint_req_status = CHECKPOINT_REQ_READY;
+            //printf("!!!!received checkpoint status %"PRId64"\n", *(int64_t*)data);
+            checkpoint_req_status = *(int64_t*)data;
+            
             break;
         }
     }
